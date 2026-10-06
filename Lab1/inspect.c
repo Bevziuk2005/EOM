@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 /* Підсумкова програма.
    Частина 1: однобайтове значення в різних формах.
@@ -33,7 +34,7 @@ static void inspect_byte(void)
     printf("Enter value (0-255): ");
     if (scanf("%d", &input) != 1 || input < 0 || input > 255) {
         printf("Потрібне число від 0 до 255\n");
-        return;
+        exit(1);
     }
 
     unsigned char value = (unsigned char)input;
