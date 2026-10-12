@@ -778,321 +778,693 @@ objdump -d -M intel analyze
 
 </details>
 
-
 <details>
 <summary><strong>Лабораторна робота 3. Побудова програми, ELF та організація пам’яті</strong></summary>
 
-# Лабораторна робота 3
+# Лабораторна робота 3. Побудова програми, ELF та організація пам'яті
 
-## Побудова програми, ELF та організація пам’яті
+**Виконав:** Бевзюк Нікіта, група КН-24
+**Середовище:** Ubuntu 24.04, x86-64, GCC 13.3.0, GNU binutils 2.42
+Усі програми збирались з `-Wall -Wextra` — попереджень немає.
 
-**Виконав:** Бевзюк Нікіта, група КН-24  
-**Середовище перевірки:** GitHub Codespaces, Ubuntu 24.04, GCC, x86-64
+**Питання лабораторної:**
+1. Як `program.c` перетворюється на executable?
+2. Де знаходяться код і різні типи даних програми?
 
-## Мета
+```
+program.c ─gcc -E→ program.i ─gcc -S→ program.s ─gcc -c→ program.o ─gcc→ program ─loader→ process
+ (source)          (preprocessed)     (Assembly)        (object file)    (ELF)            (у пам'яті)
+```
 
-Подивитися, що відбувається з програмою на C між написанням коду і запуском: як працюють preprocessing, compiler, assembler і linker, що містить ELF-файл і де в пам’яті розташовуються різні змінні.
+## Головне за 30 секунд
 
-## 1. Build pipeline
+- `gcc program.c -o program` — це чотири окремі програми підряд: preprocessor, compiler, assembler, linker.
+- `program.i` більший за `program.c` у 49 разів (830 проти 17 рядків), бо в нього вставлено `stdio.h`.
+- В object file `call add` і `call printf` мають адресу `00 00 00 00`. Поки що це порожні місця (relocations), а linker їх заповнює: у `program` вже `call 1149 <add>`.
+- Експеримент з `.bss`: масив на 400 000 байтів збільшив `bss` з 16 до 400040, а файл — лише на 16 байтів.
+- Адреси `main`, змінних, `malloc` і стека від запуску до запуску змінюються (ASLR), але відстань між `main` та глобальними змінними в `memory` завжди однакова: `0x2e67`.
+- Групування адрес збіглось із моделлю: code → rodata → data → bss → heap → stack, від нижчих до вищих.
 
-Для базового прикладу використовується program.c.
+## Файли
 
-~~~text
-program.c
-   │ gcc -E
-   ▼
-program.i       C-код після preprocessing
-   │ gcc -S
-   ▼
-program.s       текстовий Assembly x86-64
-   │ gcc -c
-   ▼
-program.o       ELF relocatable object file
-   │ gcc
-   ▼
-program         ELF executable
-   │ loader
-   ▼
-running process
-~~~
+| Файл | Завдання |
+|------|----------|
+| `program.c` | базова програма, pipeline (1–5, 7, 8, 11) |
+| `main.c`, `calculate.c` | linker error та його виправлення (6) |
+| `sections.c` | `.data`, `.bss`, `.rodata`, розміри (9, 10) |
+| `process.c` | executable і process (12) |
+| `memory.c` | де лежать змінні, ASLR (13, 14) |
+| `stack.c` | stack (15) |
+| `heap.c` | heap (16) |
+| `memory_map.c` | фінальна карта пам'яті |
 
-Команди для відтворення:
+Виконувані файли, `.i`, `.s`, `.o` у Git не додані (`.gitignore`), їх відтворюють командами з README.
 
-~~~bash
-gcc -Wall -Wextra program.c -o program
-./program
+---
 
+## 1. Preprocessing
+
+```
 gcc -E program.c -o program.i
-gcc -S -O0 -masm=intel program.i -o program.s
-gcc -c program.s -o program.o
-gcc program.o -o program_from_object
-
-file program.c program.i program.s program.o program_from_object
+file program.i
 wc -l program.c program.i
-objdump -d -M intel program.o
-~~~
+grep -n "int main" program.i
+```
 
-Результат запуску базової програми:
+```
+program.c: C source, ASCII text
+program.i: C source, ASCII text
 
-~~~text
+   17 program.c
+  830 program.i
+```
+
+`int main` у `program.i` знайшовся на 824-му рядку, тобто наш код опинився в самому кінці файлу.
+
+Початок `program.i` — службові позначки (`# 1 "program.c"`, `# 1 "/usr/include/stdc-predef.h"` та інші), далі йде вміст заголовків. Серед них є й оголошення, яке нам потрібне:
+
+```
+476: extern int printf (const char *__restrict __format, ...);
+```
+
+**Чому `program.i` значно більший за `program.c`?**
+Бо preprocessor замінив `#include <stdio.h>` на повний текст `stdio.h` та усіх заголовків, які він підключає: типи, константи, оголошення функцій. Так 17 рядків стали 830.
+
+**Що сталося з `#include <stdio.h>`?**
+Самого рядка в `.i` уже немає, замість нього лежить вміст файла.
+
+**Чи є `program.i` машинним кодом? Чи може CPU його виконати?**
+Ні. `file` показує `C source, ASCII text`: це все ще звичайний C-текст, лише директиви preprocessing вже оброблені.
+
+---
+
+## 2. Compilation: `.i` → `.s`
+
+```
+gcc -S -O0 -masm=intel program.i -o program.s
+file program.s
+```
+
+```
+program.s: assembler source, ASCII text
+```
+
+Функції `add` та `main` в Assembly:
+
+```asm
+add:
+    endbr64
+    push    rbp
+    mov     rbp, rsp
+    mov     DWORD PTR -4[rbp], edi
+    mov     DWORD PTR -8[rbp], esi
+    mov     edx, DWORD PTR -4[rbp]
+    mov     eax, DWORD PTR -8[rbp]
+    add     eax, edx                      ; ← return a + b
+    pop     rbp
+    ret
+
+main:
+    endbr64
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 16
+    mov     eax, DWORD PTR global_value[rip]   ; global_value
+    mov     esi, 20
+    mov     edi, eax
+    call    add                                ; ← виклик add(global_value, 20)
+    mov     DWORD PTR -4[rbp], eax
+    mov     eax, DWORD PTR -4[rbp]
+    mov     esi, eax
+    lea     rax, .LC0[rip]                     ; адреса рядка "Result: %d\n"
+    mov     rdi, rax
+    mov     eax, 0
+    call    printf@PLT
+    mov     eax, 0
+    leave
+    ret
+```
+
+**Якою мовою представлений `program.s`?** Мовою Assembly x86-64 у текстовому вигляді (Intel syntax, бо `-masm=intel`; про це говорять регістри `rbp`, `eax` і директива `.intel_syntax noprefix`).
+**Чи це machine code?** Ні, це текст. Machine code з'явиться після assembler.
+**Для якої ISA?** x86-64.
+**Чи видно `main` та `add`?** Так, це мітки `main:` та `add:`.
+
+---
+
+## 3. Assembly → Object file
+
+```
+gcc -c program.s -o program.o
+file program.o
+```
+
+```
+program.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+```
+
+**Чому `cat program.o` виглядає зовсім інакше?**
+Бо це двійковий файл, а не текст. Він починається з байтів `7f 45 4c 46 02 01 01 00 ...` (тобто `\x7f` і літери `ELF`), далі йдуть секції з машинним кодом, таблиця symbols та relocations. Термінал намагається показати це як символи й виводить сміття.
+
+`objdump -d -M intel program.o` знову показує Assembly, але вже перекладений з байтів. Важливий фрагмент `main` (з relocations, `objdump -dr`):
+
+```
+0000000000000018 <main>:
+  24:  8b 05 00 00 00 00     mov    eax,DWORD PTR [rip+0x0]
+            26: R_X86_64_PC32   global_value-0x4
+  31:  e8 00 00 00 00        call   36 <main+0x1e>
+            32: R_X86_64_PLT32  add-0x4
+  3e:  48 8d 05 00 00 00 00  lea    rax,[rip+0x0]
+            41: R_X86_64_PC32   .rodata-0x4
+  4d:  e8 00 00 00 00        call   52 <main+0x3a>
+            4e: R_X86_64_PLT32  printf-0x4
+```
+
+Тут видно головне: у `.o` адреси в `call` та в посиланні на `global_value` — нулі (`00 00 00 00`), а поруч стоїть запис relocation: «сюди треба підставити адресу `add` / `printf` / `global_value`». Адреси ще невідомі, їх визначить linker.
+
+Що зберігає кожен файл:
+
+| File | Representation |
+|---|---|
+| `program.c` | текст на C, написаний людиною |
+| `program.i` | текст на C після preprocessing (директиви оброблені) |
+| `program.s` | текст на Assembly x86-64 |
+| `program.o` | двійковий ELF relocatable: machine code + symbols + relocations |
+
+---
+
+## 4. Symbols
+
+```
+nm program.o
+```
+
+```
+0000000000000000 T add
+0000000000000000 B global_empty
+0000000000000000 D global_value
+0000000000000018 T main
+                 U printf
+```
+
+Літери: `T` — функція визначена в цьому файлі (секція `.text`), `D` — змінна з початковим значенням (`.data`), `B` — змінна без значення (`.bss`), `U` — undefined, тобто символ потрібен, але визначений деінде.
+
+**Чи є в `program.o` реалізація `add()`?** Так, `T add`.
+**Реалізація `main()`?** Так, `T main`.
+**Реалізація `printf()`?** Ні, лише `U printf`.
+**Як програма зможе використати `printf()`?** Реалізація `printf` лежить у C library (`libc`). Її зв'язує linker: він знаходить `printf` у бібліотеці й підставляє адресу замість нулів у relocation.
+
+---
+
+## 5. Linking
+
+```
+gcc program.o -o program_from_object
+file program_from_object
+./program_from_object
+```
+
+```
+program_from_object: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked,
+                     interpreter /lib64/ld-linux-x86-64.so.2, ... not stripped
 Result: 30
-~~~
+```
 
-program.i більший за початковий файл, тому що в нього вставляється вміст stdio.h та інших підключених заголовків. Це все ще C-код, а не машинні інструкції. program.s — Assembly у текстовому вигляді. program.o вже є двійковим object file: його не має сенсу читати через cat, зате його можна дослідити через objdump.
+Порівняння `file`: `program.o` — це `relocatable`, а `program` — `pie executable, dynamically linked` з `interpreter`, тобто він готовий до запуску й знає, що йому потрібен динамічний завантажувач.
 
-| Файл | Етап | Що містить | CPU виконує безпосередньо? |
-|---|---|---|---|
-| .c | source | код мовою C | ні |
-| .i | preprocessing | C-код із розкритими #include | ні |
-| .s | compilation | Assembly | ні, це текст |
-| .o | assembling | машинний код і таблиці symbols/relocations | ні, потрібен linker |
-| executable | linking | готовий ELF із підключеними залежностями | так, після завантаження ОС |
+Нулі в `call` лінкер замінив реальними числами. Приклад з `objdump -d program`:
 
-## 2. Symbols і linker error
+```
+117a:  e8 ca ff ff ff    call  1149 <add>
+1196:  e8 b5 fe ff ff    call  1050 <printf@plt>
+```
 
-У main.c функція calculate тільки оголошена:
+Для `call add` перевірка: `0xffffffca` = −54, наступна інструкція стоїть за `0x117f`, `0x117f − 54 = 0x1149` — адреса `add`. А `printf` викликається через таблицю `plt`, яку підготував linker для динамічного підключення.
 
-~~~c
-int calculate(int a, int b);
-~~~
+Весь pipeline пройдено:
+`program.c → program.i → program.s → program.o → program`.
 
-Тому команда gcc -c main.c -o main.o проходить. Компілятор знає тип і параметри функції, але реалізації в цьому файлі немає. Якщо виконати:
+---
 
-~~~bash
-gcc main.o -o app
-~~~
+## 6. Linker error та її виправлення
 
-linker повідомить:
+`main.c` лише оголошує `int calculate(int a, int b);`, але не реалізує її.
 
-~~~text
-undefined reference to 'calculate'
-~~~
+```
+$ gcc -c main.c -o main.o
+$                                      ← без помилок
+$ gcc main.o -o app
+/usr/bin/ld: main.o: in function `main':
+main.c:(.text+0x17): undefined reference to `calculate'
+collect2: error: ld returned 1 exit status
+```
 
-Виправлення:
+**Чому compilation пройшла, а linking — ні?**
+Для компілятора досить оголошення: він знає ім'я, тип параметрів і результат, цього досить, щоб згенерувати `call`. Реалізації він не перевіряє. Linker же з'єднує файли й для кожного `U` символу шукає визначення. Для `calculate` його не знайшлось.
 
-~~~bash
-gcc -c calculate.c -o calculate.o
-nm main.o
-nm calculate.o
-gcc main.o calculate.o -o app
-./app
-~~~
+```
+$ nm main.o
+                 U calculate          ← main.o потребує calculate
+0000000000000000 T main
+                 U printf
 
-Результат — 30. У main.o symbol calculate є невирішеною зовнішньою потребою, а в calculate.o він визначений. Linker з’єднує ці два object file. Реалізація printf знаходиться в C library, тому вона також підключається під час linking.
+$ gcc -c calculate.c -o calculate.o
+$ nm calculate.o
+0000000000000000 T calculate          ← calculate.o визначає calculate
 
-## 3. ELF executable
+$ gcc main.o calculate.o -o app && ./app
+30
+```
 
-У Codespaces результат file program має містити приблизно:
+Виправлення: скомпілювати `calculate.c` в окремий object file та передати обидва `.o` linker'у. У `main.o` символ `calculate` був `U`, у `calculate.o` він став `T`, і linker їх зв'язав. `printf` linker дістав із libc.
 
-~~~text
-ELF 64-bit LSB pie executable, x86-64
-~~~
+```
+main.o ─────────┐
+                ├──→ Linker ──→ app
+calculate.o ────┤
+libc ───────────┘
+```
 
-Команда readelf -h program показує значення такого типу:
+---
+
+## 7. ELF executable
+
+```
+file program
+readelf -h program
+```
+
+```
+program: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked,
+         interpreter /lib64/ld-linux-x86-64.so.2, ... for GNU/Linux 3.2.0, not stripped
+```
 
 | ELF property | Значення |
 |---|---|
 | Class | ELF64 |
-| Data | little endian |
-| Type | DYN (PIE executable) або EXEC |
+| Data | 2's complement, little endian |
+| Type | DYN (Position-Independent Executable file) |
 | Machine | Advanced Micro Devices X86-64 |
-| Entry point | адреса _start, залежить від збірки |
+| Entry point | 0x1060 |
 
-ELF64 означає формат ELF із 64-бітними адресами/структурами. x86-64 — архітектура машинних інструкцій, під яку створено файл.
+**Що означає ELF64?** Формат ELF у 64-бітному варіанті: 64-бітні адреси та заголовки.
+**Яку архітектуру показує Machine?** x86-64 (AMD64): файл містить інструкції саме цього процесора.
+**Тип DYN?** Це PIE: код можна завантажити за будь-якою адресою, тому адреси в `objdump` невеликі (`0x1149`), а в запущеному процесі до них додається випадкова база. Entry point `0x1060` — початок `.text`, там функція `_start`, яка потім викличе `main`.
 
-## 4. Основні секції
+---
 
-~~~bash
-readelf -S program
-nm program
-objdump -s -j .rodata program
-~~~
+## 8. ELF sections
 
-| Section | Що містить у цій роботі |
+```
+readelf -S -W program
+```
+
+Фрагмент для потрібних секцій (адреси, зсув у файлі, розмір):
+
+| Section | Адреса | Offset | Розмір | Flags |
+|---|---|---|---|---|
+| `.text` | 0x1060 | 0x1060 | 0x142 | AX (код, виконується) |
+| `.rodata` | 0x2000 | 0x2000 | 0x10 | A (лише читання) |
+| `.data` | 0x4000 | 0x3000 | 0x14 | WA (читання/запис) |
+| `.bss` | 0x4014 | 0x3014 | 0xc | WA, тип **NOBITS** |
+
+Прив'язка до нашої програми (`nm program` і `objdump`):
+
+| Section | Що містить саме тут |
 |---|---|
-| .text | машинний код main, add і службових функцій |
-| .rodata | рядок "Result: %d\\n" та інші константні дані |
-| .data | global_value = 10, бо змінна має початкове значення |
-| .bss | global_empty, бо змінна глобальна, але не ініціалізована |
+| `.text` | машинний код `add` (0x1149), `main` (0x1161) і `_start` |
+| `.rodata` | рядок `"Result: %d\n"` — `objdump -s -j .rodata` показує байти `52 65 73 75 6c 74 3a 20 25 64 0a 00` за адресою 0x2004 |
+| `.data` | `global_value = 10` за адресою 0x4010 (потрапляє в діапазон 0x4000–0x4014) |
+| `.bss` | `global_empty` за адресою 0x4018 (діапазон 0x4014–0x4020) |
 
-.bss логічно входить у пам’ять процесу, але нульові байти для неї не потрібно зберігати у файлі повністю.
+Тобто `global_value` лежить у `.data`, бо в неї є початкове значення 10, яке треба зберігати у файлі, а `global_empty` — у `.bss`. Зверніть увагу, що `.bss` має тип `NOBITS`: у файлі байтів для неї немає.
 
-## 5. Перевірка .data і .bss
+---
 
-Файл sections.c містить дві пари глобальних/static змінних і рядок. Очікуване розміщення:
+## 9. `.data` та `.bss` у `sections.c`
 
-| Об’єкт | Секція |
-|---|---|
-| initialized | .data |
-| uninitialized | .bss |
-| static_initialized | .data |
-| static_uninitialized | .bss |
-| message | .rodata |
+```
+nm sections | grep -E 'initialized|uninitialized|message'
+```
 
-У nm великі літери D/B зазвичай означають глобальні .data/.bss, а малі d/b — локальні static symbols у відповідних секціях.
+```
+0000000000004010 D initialized
+000000000000401c B uninitialized
+0000000000004014 d static_initialized
+0000000000004020 b static_uninitialized
+0000000000002010 R message
+```
 
-### Експеримент із великим масивом
+Секції в `sections` (`readelf -S`): `.rodata` починається з 0x2000, `.data` з 0x4000, `.bss` з 0x4018.
+
+| Об'єкт | Літера в `nm` | Секція | Чому |
+|---|---|---|---|
+| `initialized` | `D` | `.data` | глобальна, значення 123 |
+| `uninitialized` | `B` | `.bss` | глобальна, без значення |
+| `static_initialized` | `d` | `.data` | static (малі літери — видима лише в цьому файлі), значення 456 |
+| `static_uninitialized` | `b` | `.bss` | static, без значення |
+| `message` | `R` | `.rodata` | `const`, лише читання |
+
+Перевірка вмісту (`objdump -s`):
+
+```
+.data:    4010  7b000000 c8010000         ← 0x7b = 123 і 0x1c8 = 456
+.rodata:  2010  43 6f 6d 70 75 74 65 72 20 53 79 73 74 65 6d 73 00   ← "Computer Systems"
+```
+
+Значення 123 і 456 справді лежать у файлі в `.data`, а текст `Computer Systems` — у `.rodata`. Для `uninitialized` та `static_uninitialized` у файлі байтів немає.
+
+---
+
+## 10. Розмір областей та велика `.bss`
+
+```
+size sections
+```
 
 Спочатку:
 
-~~~bash
-size sections
-~~~
+```
+   text    data     bss     dec     hex  filename
+   1450     608      16    2074     81a  sections
+```
+Розмір файлу: 16144 байти.
 
-Потім у sections.c замінити:
+Після заміни `int uninitialized;` на `int large_array[100000];`:
 
-~~~c
-int uninitialized;
-~~~
+```
+   text    data     bss     dec     hex  filename
+   1450     608  400040  402098   622b2  sections
+```
+Розмір файлу: 16160 байтів.
 
-на:
+| | було | стало | різниця |
+|---|---:|---:|---:|
+| text | 1450 | 1450 | 0 |
+| data | 608 | 608 | 0 |
+| **bss** | 16 | **400040** | **+400 024** |
+| розмір файлу, байт | 16144 | 16160 | **+16** |
 
-~~~c
-int large_array[100000];
-~~~
+**Чому `int large_array[100000]` збільшує `bss`, але не файл на ~400 000 байтів?**
+Масив — глобальний і без початкового значення, тому він лежить у `.bss`, а `.bss` — це секція `NOBITS`. У файлі записано лише її розмір («потрібно 400040 байтів»), а не самі нулі. Реальну пам'ять під неї виділяє loader, коли програма запускається, і заповнює її нулями. Файл виріс лише на кілька службових байтів у заголовках секцій. Якби масив був ініціалізований (`= {1, 2, ...}`), його довелось би зберігати у `.data`, і файл справді виріс би приблизно на 400 000 байтів.
 
-і знову виконати:
+---
 
-~~~bash
-gcc sections.c -o sections
-size sections
-ls -lh sections
-~~~
+## 11. Dynamic libraries
 
-Змінюється переважно число в колонці bss: воно збільшується приблизно на 400000 байтів. Розмір самого executable не збільшується на таку саму величину, тому що .bss описує нульову пам’ять, яку loader виділяє під час запуску. У файл записується її розмір, а не всі нульові байти.
+```
+$ ldd program
+    linux-vdso.so.1 (0x00007f7f08671000)
+    libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f7f08400000)
+    /lib64/ld-linux-x86-64.so.2 (0x00007f7f08673000)
+```
 
-## 6. Dynamic libraries
+Є `libc.so.6` — стандартна бібліотека C, в якій і реалізовано `printf`, а також `ld-linux-x86-64.so.2` — динамічний завантажувач (той самий `interpreter`, що ми бачили у `file`). `linux-vdso.so.1` — спеціальна «бібліотека», яку надає ядро.
 
-~~~bash
-ldd program
-~~~
+**Чи є повна реалізація `printf()` у нашому executable?**
+Ні. Розмір `program` — усього 16072 байти, а `main` викликає `printf` через заглушку `printf@plt` (див. `call 1050 <printf@plt>` вище); реальний `printf` лежить у `libc.so.6`.
+**Що означає `.so`?** Shared object — спільна бібліотека.
+**Чому кілька програм можуть використовувати одну?** Бібліотека завантажується в пам'ять один раз, а процеси підключають її код у свій адресний простір; код лише читається, тому ділитися ним безпечно.
+**Яка перевага перед копіюванням в кожен executable?** Executable значно менші (у нас 16 КБ), оперативна пам'ять та диск економляться, а виправлення помилки в `libc` діє на всі програми без перекомпіляції.
 
-Серед залежностей зазвичай є libc.so.6. Розширення .so означає shared object. Повна реалізація printf не копіюється в кожен executable: програма має посилання на library, а loader підключає її під час запуску. Це економить місце на диску і дозволяє кільком процесам використовувати спільний код бібліотеки.
+---
 
-## 7. Executable і process
+## 12. Executable і process
 
-process до запуску — це просто файл на диску. Після команди ./process ОС створює process, виділяє йому virtual address space, stack, heap і підключає бібліотеки. process.c друкує PID і чекає 60 секунд, тому його можна побачити з іншого terminal:
-
-~~~bash
+```
 gcc -Wall -Wextra process.c -o process
 ./process
-ps -p PID
-~~~
+```
 
-PID належить запущеному процесу, а не файлу.
+```
+PID: 395
+Process is running...
+```
 
-## 8. Де знаходяться змінні
+У другому terminal:
 
-Для memory.c перед запуском прогноз був таким:
+```
+$ ps -p 395 -o pid,comm,etime
+  PID COMMAND             ELAPSED
+  395 process               00:01
 
-| Об’єкт | Прогноз |
+$ readlink /proc/395/exe
+.../process
+
+$ grep -E '^(Name|State)' /proc/395/status
+Name:   process
+State:  S (sleeping)
+```
+
+PID щоразу інший (він видається при запуску).
+
+**Різниця:** `process` як файл — це ELF на диску: нерухомий, не споживає CPU й пам'яті, і ним можна запустити скільки завгодно процесів. `PID = 395` — запущений **process**: ОС створила для нього адресний простір, підключила бібліотеки, і він має стан (`S` — спить, бо виконує `sleep(60)`). `/proc/395/exe` вказує назад на файл, з якого цей процес запущений.
+
+---
+
+## 13. Де знаходяться дані: `memory.c`
+
+**Прогноз до запуску:**
+
+| Об'єкт | Очікувана область |
 |---|---|
-| main | code / .text |
-| global_initialized | .data |
-| global_uninitialized | .bss |
-| static_initialized | .data |
-| static_uninitialized | .bss |
+| main | code |
+| global_initialized | data |
+| global_uninitialized | bss |
+| static_initialized | data |
+| static_uninitialized | bss |
 | local | stack |
-| dynamic | heap |
+| dynamic allocation | heap |
 
-Команди:
-
-~~~bash
+```
 gcc -Wall -Wextra -O0 memory.c -o memory
 ./memory
-./memory
-./memory
-~~~
+```
 
-У результаті адреси global_initialized і static_initialized знаходяться близько одна до одної, так само як дві .bss-змінні. Локальна змінна має адресу в області stack, а malloc повертає адресу з heap. Код знаходиться в окремій області address space.
+```
+Function main:         0x55833285f1a9
+Global initialized:    0x558332862010
+Global uninitialized:  0x55833286201c
+Static initialized:    0x558332862014
+Static uninitialized:  0x558332862020
+Local variable:        0x7ffddc4023bc
+Dynamic allocation:    0x5583391df2a0
+```
 
-Точні адреси між запусками можуть змінюватися через ASLR. Це нормальна поведінка: операційна система не повинна щоразу розміщувати всі області процесу за однаковими адресами.
+Звіряємо з таблицею секцій `memory` (`nm memory`: `main` — `0x11a9`, `global_initialized` — `0x4010`, `static_initialized` — `0x4014`, `global_uninitialized` — `0x401c`, `static_uninitialized` — `0x4020`). Усі зсуви збігаються з молодшими цифрами адрес вище (`...1a9`, `...010`, `...014`, `...01c`, `...020`). Тобто:
 
-## 9. Stack experiment
+| Об'єкт | Адреса (запуск 1) | Область | Прогноз |
+|---|---|---|---|
+| main | 0x55833285f1a9 | `.text` | ✓ |
+| global_initialized | 0x558332862010 | `.data` | ✓ |
+| static_initialized | 0x558332862014 | `.data` | ✓ |
+| global_uninitialized | 0x55833286201c | `.bss` | ✓ |
+| static_uninitialized | 0x558332862020 | `.bss` | ✓ |
+| dynamic allocation | 0x5583391df2a0 | heap | ✓ |
+| local | 0x7ffddc4023bc | stack | ✓ |
 
-~~~bash
-gcc -Wall -Wextra -O0 stack.c -o stack
-./stack
-~~~
+Прогноз підтвердився повністю.
 
-Вкладені виклики створюють окремі stack frames для level1, level2 і level3. У типовому x86-64 результаті адреси a, b, c зменшуються в напрямку глибших викликів. Це узгоджується з моделлю stack, який на цій ABI росте вниз. Це спостереження стосується саме перевіреного x86-64 середовища, а не всіх можливих процесорів.
+**Які адреси близько одна до одної?**
+Чотири глобальні/static змінні розташовані впритул: від `...2010` до `...2020`, різниця лише кілька байтів. Адреса `main` теж у тому ж образі програми (`0x55833285f...`), але в іншій секції: `.text` на 0x2e67 нижче.
+**Чи `global_initialized` і `global_uninitialized` поруч?** Так, `...010` і `...01c`, різниця 12 байтів, хоча одна у `.data`, інша у `.bss`: ці секції стоять впритул одна до одної.
+**Чи `local` поруч із глобальними?** Ні: `0x7ffddc4023bc` відрізняється від `0x558332862010` дуже сильно (старші цифри `7ff...` проти `558...`).
+**Чи heap поруч із local?** Ні. Heap (`0x5583391df2a0`) починається з тих самих `0x558...`, що й образ програми, а stack — з `0x7ff...`. Між ними величезна відстань (десятки терабайт віртуального адресного простору).
+**Що це говорить?** Адресний простір поділений на області: код і дані програми в одному місці, heap трохи вище, stack далеко вгорі.
 
-## 10. Heap experiment
+---
 
-~~~bash
-gcc -Wall -Wextra -O0 heap.c -o heap
-./heap
-~~~
+## 14. Чи однакові адреси при кожному запуску?
 
-a, b, c належать heap, але не обов’язково мають ідеально послідовні адреси. malloc працює через allocator, який може додавати службові заголовки, повторно використовувати вільні блоки або отримувати пам’ять різними порціями. Тому правильний висновок: усі три адреси належать heap, але послідовність не гарантується.
+Три запуски `./memory`:
 
-## 11. Фінальна карта пам’яті
+| Об'єкт | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| main | 0x55833285f1a9 | 0x563292aa51a9 | 0x55b4732ee1a9 |
+| global_initialized | 0x558332862010 | 0x563292aa8010 | 0x55b4732f1010 |
+| local | 0x7ffddc4023bc | 0x7ffed3f6ea7c | 0x7ffe3b7c315c |
+| dynamic | 0x5583391df2a0 | 0x5632c91302a0 | 0x55b477c882a0 |
 
-memory_map.c об’єднує всі основні випадки в одній програмі.
+**Чи однакові адреси?** Ні, вони щоразу інші. Це не помилка, а **ASLR** (Address Space Layout Randomization): ОС навмисно випадково зсуває початок образу програми, heap і stack, щоб ускладнити атаки, які покладаються на відомі адреси.
 
-~~~text
+Спостереження: молодші 12 біт (три останні hex-цифри) не змінюються (`...1a9`, `...010`, `...2a0`), бо зсув кратний розміру сторінки (4096). Також не змінюється відстань між об'єктами одного образу: `global_initialized − main` у всіх трьох запусках дорівнює `0x2e67`. Тобто випадково зсувається образ програми цілком, а не кожна змінна окремо. Відстань до heap і stack щоразу інша.
+
+---
+
+## 15. Stack: `stack.c`
+
+```
+gcc -Wall -Wextra -O0 stack.c -o stack && ./stack
+```
+
+```
+level1: &a = 0x7ffe9cd4c864
+level2: &b = 0x7ffe9cd4c844
+level3: &c = 0x7ffe9cd4c824
+```
+
+| Виклик | Адреса | Різниця від попередньої |
+|---|---|---|
+| level1 → `a` | ...c864 | |
+| level2 → `b` | ...c844 | −0x20 (−32 байти) |
+| level3 → `c` | ...c824 | −0x20 (−32 байти) |
+
+**Чи змінюються адреси при вкладених викликах?** Так: кожен виклик створює новий stack frame, тому локальні змінні лежать на різних адресах.
+**У якому напрямку?** Убік **зменшення**: чим глибший виклик, тим менша адреса.
+**Чи узгоджується це з моделлю stack для x86-64?** Так, у цьому середовищі stack росте вниз (від вищих адрес до нижчих). Один frame тут займає 32 байти (збережений `rbp`, адреса повернення від `call`, локальна змінна та вирівнювання). Це спостереження стосується саме x86-64 Linux, не всіх архітектур.
+
+---
+
+## 16. Heap: `heap.c`
+
+**Прогноз до запуску:** адреси `a`, `b`, `c` можуть виявитись близькими, але гарантії послідовності немає.
+
+```
+gcc -Wall -Wextra -O0 heap.c -o heap && ./heap
+```
+
+```
+a: 0x55d03388c2a0
+b: 0x55d03388c2c0
+c: 0x55d03388c2e0
+```
+
+Адреси зростають із кроком `0x20` (32 байти), хоча `sizeof(int)` лише 4. Імовірно, allocator додає службовий заголовок і вирівнює блоки, тому кожен маленький блок займає мінімальну порцію.
+
+У цьому запуску адреси виявились послідовними, але робити з цього правило «`malloc` завжди повертає послідовні адреси» не можна: allocator може повторно використовувати вільні блоки або брати пам'ять в іншому порядку. Головне, що експеримент показує: всі три адреси належать heap (`0x55d0...`), а не stack (`0x7ff...`).
+
+---
+
+## 17. Фінальна програма `memory_map.c`
+
+```
+gcc -Wall -Wextra -O0 memory_map.c -o memory_map && ./memory_map
+```
+
+```
+Memory map experiment
+Code/function:           0x5559cd1ff1c9
+String literal:          0x5559cd20001a
+Global initialized:      0x5559cd202010
+Global uninitialized:    0x5559cd20201c
+Static initialized:      0x5559cd202014
+Static uninitialized:    0x5559cd202020
+Heap allocation:         0x5559e12192a0
+Stack/local:             0x7ffdc8f170f4
+```
+
+Звірка із секціями `memory_map` (`readelf -S`): `.text` 0x10e0–0x134c, `.rodata` 0x2000–0x2113, `.data` 0x4000–0x4018, `.bss` 0x4018–0x4028. Образ завантажений з базою `0x5559cd1fe000` (`0x5559cd1ff1c9 − 0x11c9`), отже зсуви: рядок — `0x201a` (у `.rodata`), `global_initialized` — `0x4010` та `static_initialized` — `0x4014` (у `.data`), `global_uninitialized` — `0x401c`, `static_uninitialized` — `0x4020` (у `.bss`).
+
+### Концептуальна карта пам'яті (з реальними адресами цього запуску)
+
+```
 Вищі адреси
 
-┌──────────────────────────────┐
-│ Stack                        │
-│ local                        │
-├──────────────────────────────┤
-│ ...                          │
-├──────────────────────────────┤
-│ Heap                         │
-│ malloc allocation            │
-├──────────────────────────────┤
-│ .bss                         │
-│ global_uninitialized         │
-│ static_uninitialized         │
-├──────────────────────────────┤
-│ .data                        │
-│ global_initialized           │
-│ static_initialized           │
-├──────────────────────────────┤
-│ .rodata                      │
-│ "Computer Systems"           │
-├──────────────────────────────┤
-│ .text                        │
-│ show_title, main             │
-└──────────────────────────────┘
+┌────────────────────────────────────────────────┐
+│ Stack                                          │
+│   local            0x7ffdc8f170f4              │
+├────────────────────────────────────────────────┤
+│ ... (величезний розрив) ...                    │
+├────────────────────────────────────────────────┤
+│ Heap                                           │
+│   malloc           0x5559e12192a0              │
+├────────────────────────────────────────────────┤
+│ .bss                                           │
+│   static_uninitialized  0x5559cd202020         │
+│   global_uninitialized  0x5559cd20201c         │
+├────────────────────────────────────────────────┤
+│ .data                                          │
+│   static_initialized    0x5559cd202014         │
+│   global_initialized    0x5559cd202010         │
+├────────────────────────────────────────────────┤
+│ .rodata                                        │
+│   "Computer Systems"    0x5559cd20001a         │
+├────────────────────────────────────────────────┤
+│ .text                                          │
+│   show_title            0x5559cd1ff1c9         │
+└────────────────────────────────────────────────┘
 
 Нижчі адреси
-~~~
+```
 
-Це концептуальна схема, а не карта всього процесу. Реальні проміжки між областями залежать від ОС, linker і ASLR.
+Порядок адрес від найменшої до найбільшої: `.text` → `.rodata` → `.data` → `.bss` → heap → stack. Він збігається з концептуальною схемою з лабораторної. Реальні проміжки між областями не однакові й залежать від ASLR.
 
-## 12. Контрольні питання
+Ще одна деталь: у `memory_map.c` рядок `const char *message = "Computer Systems"` складається з двох частин. Сам текст (`0x...20001a`) лежить у `.rodata`, а вказівник `message` — це звичайна локальна змінна у stack.
 
-1. Основні етапи C-програми: preprocessing, compilation, assembling, linking, loading.
-2. Preprocessor: обробляє #include, #define і умовну компіляцію.
-3. Compiler: перетворює C-код у Assembly або одразу передає його assembler через проміжний етап.
-4. Assembler: перетворює Assembly на object file з машинним кодом.
-5. Object file: містить машинний код, symbols, relocations і секції.
-6. Linker: з’єднує object files і бібліотеки, розв’язує зовнішні symbols.
-7. undefined reference: linker не знайшов реалізацію потрібної функції або змінної.
-8. Symbol: ім’я об’єкта або функції, яке використовують compiler і linker.
-9. Header і library: header містить оголошення та типи, library містить готову реалізацію.
-10. ELF: стандартний формат executable та object files у Linux/Unix.
-11. .text: машинні інструкції програми.
-12. .rodata: константні дані, наприклад string literals.
-13. .data і .bss: .data містить ініціалізовані змінні, .bss — неініціалізовані або нульові.
-14. Велика .bss: збільшує пам’ять процесу, але не зобов’язана так само збільшувати файл, бо нульові байти не зберігаються повністю.
-15. ldd: показує shared libraries, потрібні executable.
-16. Executable і process: executable — файл, process — його запущений екземпляр із власною пам’яттю та PID.
-17. Local variables: зазвичай знаходяться в stack frame.
-18. Heap: область для динамічних об’єктів, отриманих через malloc/free.
-19. Stack і heap: stack автоматично працює через виклики функцій, heap керується програмою і має довільний час життя блоків.
-20. Зміна адрес: через ASLR та роботу allocator.
-21. Temporal locality: якщо дані використали зараз, їх імовірно використають знову скоро.
-22. Spatial locality: якщо звернулися до однієї адреси, імовірно скоро звернуться до сусідніх адрес.
+### Pipeline для `memory_map.c`
 
-## Висновок
+```
+gcc -E memory_map.c -o memory_map.i
+gcc -S -O0 -masm=intel memory_map.i -o memory_map.s
+gcc -c memory_map.s -o memory_map.o
+gcc memory_map.o -o memory_map
+file memory_map.c memory_map.i memory_map.s memory_map.o memory_map
+```
 
-Одна команда gcc program.c -o program приховує кілька різних етапів. Після preprocessing і compilation ще немає готової програми: object files мають symbols і зовнішні посилання, які повинен зібрати linker. ELF зберігає код і дані в окремих секціях, а після запуску loader розкладає їх у virtual address space процесу. Експерименти з memory.c, stack.c і heap.c показали різницю між .data, .bss, stack і heap та пояснили, чому адреси не є сталими між запусками.
+```
+memory_map.c: C source, ASCII text
+memory_map.i: C source, ASCII text
+memory_map.s: assembler source, ASCII text
+memory_map.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), not stripped
+memory_map:   ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, ...
+```
 
-> Примітка про локальну Windows-перевірку: у цій папці код також компілюється MinGW GCC, але його .exe мають формат PE/COFF, а не ELF. Тому команди readelf, ldd і /proc треба запускати саме в Ubuntu/GitHub Codespaces, як вимагає умова лабораторної.
+`memory_map.c` має 38 рядків, `memory_map.i` — 1957 (додались `stdio.h` та `stdlib.h`).
+
+| Файл | Етап | Що містить | Чи може CPU виконати безпосередньо? |
+|---|---|---|---|
+| `.c` | source | код C, написаний людиною | Ні |
+| `.i` | після preprocessor | той самий C, але з розкритими `#include` (1957 рядків) | Ні |
+| `.s` | після compiler | текст Assembly x86-64 | Ні, це текст |
+| `.o` | після assembler | machine code, symbols, relocations (адреси `call` ще нулі) | Ні, ще треба linker |
+| executable | після linker | готовий ELF: код, дані, адреси підставлено, вказано libc | Так (після завантаження ОС) |
+
+---
+
+## Відповіді на контрольні питання
+
+1. **Етапи від C до executable:** preprocessing → compilation → assembling → linking, а потім loading під час запуску.
+2. **Preprocessor:** обробляє директиви `#include`, `#define`, умовну компіляцію. Результат — `.i` (у нас 17 рядків стали 830).
+3. **Compiler:** перетворює C-код (з `.i`) на Assembly (`.s`).
+4. **Assembler:** перетворює Assembly на object file (`.o`) з machine code.
+5. **Object file:** містить machine code, секції (`.text`, `.data`, `.bss`, `.rodata`), таблицю symbols та relocations.
+6. **Навіщо linker:** об'єднує object files і бібліотеки, зіставляє імена (`U`) з визначеннями (`T`, `D`...) і підставляє справжні адреси замість нулів.
+7. **Undefined reference:** linker не знайшов реалізації функції або змінної, яку хтось використовує (як `calculate`).
+8. **Symbol:** ім'я функції чи змінної в object file, за яким linker їх знаходить (`nm` їх показує).
+9. **Header і library:** header (`stdio.h`) містить лише оголошення, library (`libc`) — готову реалізацію. Header потрібен компілятору, library — linker.
+10. **ELF:** стандартний формат виконуваних і object-файлів у Linux.
+11. **`.text`:** машинні інструкції (у нас `add`, `main`, `_start`).
+12. **`.rodata`:** константні дані лише для читання: рядок `"Result: %d\n"`, `message`.
+13. **`.data` проти `.bss`:** `.data` — змінні з початковим значенням (їх значення зберігаються в файлі: `global_value = 10`, `initialized = 123`); `.bss` — змінні без значення (`global_empty`), які на старті нулюються.
+14. **Чому велика `.bss` не збільшує файл:** бо `.bss` має тип NOBITS: у файлі записаний лише розмір, а нулі створює loader. У нас `bss` +400 024, а файл +16 байтів.
+15. **`ldd`:** показує shared libraries, потрібні executable (у нас `libc.so.6` та `ld-linux-x86-64.so.2`).
+16. **Executable проти process:** executable — файл на диску; process — його запущений екземпляр з PID, адресним простором і станом.
+17. **Local variables:** у stack frame функції (`0x7ff...` у наших запусках).
+18. **Heap:** для динамічної пам'яті, яку програма сама просить (`malloc`) та звільняє (`free`).
+19. **Stack проти heap:** stack керується автоматично викликами функцій (у нас росте вниз, кожен frame 32 байти); heap керує програма, блоки живуть, доки їх не звільнять, і порядок адрес не гарантований.
+20. **Чому адреси змінюються між запусками:** через ASLR, ОС випадково зсуває образ, heap і stack. Відстані всередині образу (наприклад, `0x2e67`) не змінюються.
+21. **Temporal locality:** якщо до даних щойно зверталися, до них, імовірно, зверніться знову скоро (наприклад, змінна `sum` у циклі).
+22. **Spatial locality:** якщо звернулись до адреси, імовірно, скоро звернуться й до сусідніх (елементи масиву підряд, змінні в одній секції). У нашому випадку близькі адреси `.data`/`.bss` це добре показують.
+
+---
+
+## Короткий висновок
+
+Експериментально встановлено:
+
+- `gcc program.c -o program` приховує чотири етапи: `.c` → `.i` (preprocessor, 17 → 830 рядків) → `.s` (compiler, текст Assembly) → `.o` (assembler, binary ELF) → executable (linker);
+- в object file адреси `call` та посилань на змінні ще нульові, поруч є relocations; linker їх заповнює (`call 1149 <add>`), тому без реалізації `calculate` отримуємо `undefined reference`, а з `calculate.o` — працюючу програму;
+- ELF64 PIE для x86-64 має секції `.text` (код), `.rodata` (константи), `.data` (змінні зі значенням) та `.bss` (змінні без значення); у `.bss` у файлі немає байтів, тому масив на 400 000 байтів збільшив `bss` на 400 024, а файл усього на 16 байтів;
+- `printf` не копіюється в програму, а береться із `libc.so.6` під час запуску (`ldd`);
+- executable — це файл, а process — його виконання з PID та власним адресним простором;
+- у процесі адреси групуються за областями: `.text` → `.rodata` → `.data` → `.bss` → heap → stack, local-змінні у stack (`0x7ff...`), `malloc` у heap (`0x55...`);
+- stack на x86-64 росте вниз (`−0x20` на кожен виклик), а `malloc` дає окремі блоки в heap без гарантій послідовності;
+- адреси між запусками змінюються через ASLR, але відстані всередині образу програми сталі.
+
+</details>
 
 
+<details>
+<summary><strong>Лабораторна робота 4.</strong></summary>
 
 </details>
