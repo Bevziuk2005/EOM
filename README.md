@@ -776,5 +776,12 @@ objdump -d -M intel analyze
 
 Відтворити все можна командами `gcc -S -masm=intel`, `objdump -d -M intel` та `diff -u` з цього README.
 
+</details>
+
+
+<details>
+<summary><strong>Лабораторна робота 3. Представлення даних у пам'яті</strong></summary>
+
+
 
 </details>
