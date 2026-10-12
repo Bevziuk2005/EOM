@@ -796,15 +796,6 @@ program.c ─gcc -E→ program.i ─gcc -S→ program.s ─gcc -c→ program.o �
  (source)          (preprocessed)     (Assembly)        (object file)    (ELF)            (у пам'яті)
 ```
 
-## Головне за 30 секунд
-
-- `gcc program.c -o program` — це чотири окремі програми підряд: preprocessor, compiler, assembler, linker.
-- `program.i` більший за `program.c` у 49 разів (830 проти 17 рядків), бо в нього вставлено `stdio.h`.
-- В object file `call add` і `call printf` мають адресу `00 00 00 00`. Поки що це порожні місця (relocations), а linker їх заповнює: у `program` вже `call 1149 <add>`.
-- Експеримент з `.bss`: масив на 400 000 байтів збільшив `bss` з 16 до 400040, а файл — лише на 16 байтів.
-- Адреси `main`, змінних, `malloc` і стека від запуску до запуску змінюються (ASLR), але відстань між `main` та глобальними змінними в `memory` завжди однакова: `0x2e67`.
-- Групування адрес збіглось із моделлю: code → rodata → data → bss → heap → stack, від нижчих до вищих.
-
 ## Файли
 
 | Файл | Завдання |
