@@ -1,0 +1,5 @@
+# комітимо тільки код і README, executable відтворюються командами з README
+*
+!*.c
+!*.md
+!.gitignore
