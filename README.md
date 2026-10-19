@@ -2752,17 +2752,6 @@ Correct: YES
 
 У п'ятій лабі ми дійшли до потоків. Тут дві речі, які ОС дає кожному процесу: **віртуальний адресний простір** (пам'ять) і **file descriptors** (введення-виведення). Усі результати нижче отримані реальними запусками (Linux x86-64, ядро 6.18, gcc, 2 ядра). Адреси й PID при кожному запуску інші, важлива не цифра, а закономірність.
 
-## Головне за 30 секунд
-
-- Усі адреси, які друкує програма, **віртуальні**. Фізичної RAM вони не показують.
-- Код, глобальні дані, heap, бібліотеки й stack лежать у різних **регіонах** (`/proc/PID/maps`), кожен зі своїми правами `r/w/x`.
-- Розмір сторінки в цій системі: **4096 байтів**. Адреса = номер сторінки + зсув усередині неї.
-- `malloc(100 МБ)` збільшив `VmSize` на 100 МБ, а `VmRSS` майже не змінився (1,7 МБ). Реальна RAM з'явилась лише після запису по сторінках (стало 104 МБ).
-- `*NULL = 42` дає `SIGSEGV`, код виходу 139. Це захист пам'яті, а не поломка RAM.
-- Дескриптори 0, 1, 2 це stdin, stdout, stderr. `open()` повертає наступний вільний номер (тут 3).
-- `printf` пише у буфер stdio, а `write` одразу йде в ядро. Тому `printf("ABC"); write("D")` дає `DABC`.
-- `file_copy` працює на `open/read/write/close`, враховує partial write і копіює і текст, і бінарник байт у байт.
-
 ## Файли
 
 | Файл | Завдання |
@@ -3363,5 +3352,534 @@ Kernel: розв'язує fd -> файл -> offset -> виконує I/O
 Експеримент із `malloc(100 МБ)` показав головну ідею віртуальної пам'яті: адресний простір резервується одразу (`VmSize` +100 МБ), а фізична RAM видається, коли сторінку вперше торкаються (`VmRSS` з 1,7 МБ до 104 МБ). Запис за нульовою адресою завершується `SIGSEGV`, тобто захист забезпечує апаратура разом із ядром.
 
 У частині про I/O дескриптор виявився просто номером у таблиці процесу, а перенаправлення в shell міняє, на що він вказує. Побачили повний цикл `open -> read -> write -> EOF -> close` у strace, зміну offset і `lseek`, а також різницю між буфером stdio і прямим `write` (`DABC`, виправляється `fflush`). У `file_copy` об'єднано обидві теми: дані з файла через ядро потрапляють у буфер у віртуальній пам'яті процесу, а потім так само в інший файл, причому partial write обробляється циклом.
+
+</details>
+
+
+
+<details>
+<summary><strong>Лабораторна робота 7. Pipes, Redirection, Signals та Mini-Shell</strong></summary>
+
+# Лабораторна робота 7. Pipes, Redirection, Signals та Mini-Shell
+
+**Виконав:** Бевзюк Нікіта, КН-24
+**Дисципліна:** Архітектура ЕОМ, операційні системи та системне програмування
+
+Остання лаба курсу. Тут усе, що було раніше (процеси, `fork`/`exec`, дескриптори, I/O), збирається докупи в одну програму: власний mini-shell. Усі результати нижче отримані реальними запусками (Linux x86-64, gcc, `-Wall -Wextra` без попереджень). PID у виведенні щоразу інші.
+
+
+## Файли
+
+| Файл | Завдання |
+|---|---|
+| `pipe_basic.c` | 1: pipe в одному процесі |
+| `pipe_processes.c` | 2: parent пише, child читає |
+| `pipe_no_close.c` | 3: що буде без `close()` (режими `bad` / `good`) |
+| `dup2_output.c` | 4: stdout у файл через `dup2` |
+| `redirect_exec.c` | 5: `fork` + `dup2` + `execvp("ls -l")` |
+| `pipeline.c` | 6: `ls -l \| wc -l` |
+| `signal_int.c` | 7: handler для SIGINT через `sigaction` |
+| `signal_parent_child.c` | 8: parent шле child-у SIGTERM / SIGKILL (режими `default`, `handler`, `kill`) |
+| `mini_shell.c` | фінальне: mini-shell |
+
+Збірка: `gcc -Wall -Wextra файл.c -o файл`.
+
+---
+
+# Part I. Pipes
+
+## Завдання 1. pipe_basic
+
+```
+$ ./pipe_basic
+Read end:  3
+Write end: 4
+Received: Hello through pipe!
+```
+
+0, 1, 2 уже зайняті, тому `pipe()` взяв наступні вільні: 3 (читання) і 4 (запис).
+
+```
+message --write()--> pipefd[1] --> [ PIPE у ядрі ] --> pipefd[0] --read()--> buffer
+```
+
+- **Чи pipe є regular file?** Ні. Це безіменний буфер в ядрі, у файловій системі його немає (у `/proc/PID/fd` він показується як `pipe:[1480]`). Позиції (offset) у нього немає: дані читаються по черзі і зникають.
+- **Чому до pipe застосовні `read`/`write`?** Бо `read`/`write` працюють з дескрипторами, а не з «файлами». Pipe це теж ресурс за дескриптором, тому інтерфейс той самий (ідея Unix: усе є файлом/дескриптором).
+- **Чому `pipe()` повертає два дескриптори?** Pipe односпрямований: один кінець лише для запису, другий лише для читання. Окремі кінці можна роздати різним процесам і закривати незалежно (на цьому тримається EOF).
+
+## Завдання 2. pipe_processes
+
+```
+$ ./pipe_processes
+Child received: Message from parent
+```
+
+### Descriptor map
+
+Одразу після `fork()` child успадкував **копію** обох дескрипторів:
+
+```
+Parent                         Child
+fd 3 -> pipe READ              fd 3 -> pipe READ
+fd 4 -> pipe WRITE             fd 4 -> pipe WRITE
+```
+
+Потім кожен закриває зайве:
+
+```
+Parent: close(3)  -> лишається fd 4 (запис)
+Child:  close(4)  -> лишається fd 3 (читання)
+
+Parent --write--> fd 4 ==> [ PIPE ] ==> fd 3 --read--> Child
+```
+
+### strace
+
+```
+$ strace -f -e trace=pipe,pipe2,clone,fork,vfork,read,write,close,wait4 ./pipe_processes
+pipe2([3, 4], 0)                        = 0
+clone(...SIGCHLD...) = 314                          <- fork() у glibc це clone
+[pid 313] close(3)                      = 0         <- parent закрив read end
+[pid 313] write(4, "Message from parent\n", 20) = 20 <- parent пише
+[pid 314] close(4)                      = 0         <- child закрив write end
+[pid 313] close(4)                      = 0         <- parent закрив write end
+[pid 314] read(3, "Message from parent\n", 127) = 20 <- child читає
+[pid 313] wait4(314, ...)                           <- parent чекає
+[pid 314] close(3)                      = 0
+[pid 314] write(1, "Child received: ...", 36) = 36
+[pid 314] +++ exited with 0 +++
+--- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=314, ...} ---
+```
+
+(Рядки двох процесів перемішані, бо `-f` показує їх одночасно, і слово `unfinished` означає лише, що виклик ще не повернувся.) Усе з завдання на місці: pipe, clone (fork), close, write, read, close, wait. Бачимо і `SIGCHLD`, який отримує parent, коли child завершується.
+
+## Завдання 3. Що буде без close()
+
+`pipe_no_close.c` у режимі `good` child закриває свій write end, у режимі `bad` не закриває. Parent у обох режимах пише одне повідомлення і закриває свій write end.
+
+```
+$ ./pipe_no_close good
+[parent 291] write end closed, waiting for child
+[child 292] reading until EOF...
+[child] got 12 bytes
+[child] EOF                         <- є EOF, програма завершилась
+$ echo $?
+0
+
+$ timeout 3 ./pipe_no_close bad
+[parent 294] write end closed, waiting for child
+[child 295] reading until EOF...
+[child] got 12 bytes                <- повідомлення отримав
+                                    <- і тиша: read() не повертає 0
+$ echo $?
+124                                 <- 124 = timeout вбив зависле
+```
+
+Подивився на завислий child:
+
+```
+State:  S (sleeping)
+wchan:  anon_pipe_read              <- спить усередині read() з pipe
+fd:
+  0 -> /dev/null
+  1 -> bad.out
+  3 -> pipe:[1480]   (lr-x, read end)
+  4 -> pipe:[1480]   (l-wx, write end)    <- ось він, забутий
+```
+
+Child тримає відкритим **власний** write end (fd 4). З точки зору ядра, у pipe ще є «письменник» (сам child), який теоретично може щось дописати. Тому `read` чекає, а не повертає 0.
+
+**Чому «pipe empty» не означає EOF?** Порожній pipe при живому writer це просто «даних поки немає, зачекай» (read блокується). EOF це «порожній pipe **+** усі write ends закриті»: тоді нових даних бути не може, і `read` повертає 0. Тому кожен процес має закрити всі кінці, які йому не потрібні, особливо write end у читача і в parent.
+
+## Part I, що додатково спостерігав
+
+- `read()` на порожньому pipe з відкритим writer **блокується** (стан `S`, `anon_pipe_read`), це і є blocking behavior pipe.
+- `write()` у pipe, де вже нікому читати (всі read ends закриті), дає `SIGPIPE` / `EPIPE`. Бачив це в mini-shell: `yes | head -n 2` (див. нижче).
+
+---
+
+# Part II. Redirection
+
+## Завдання 4. dup2
+
+```
+$ ./dup2_output          # на екрані порожньо
+$ cat redirected.txt
+This goes to the file
+```
+
+strace:
+
+```
+openat(AT_FDCWD, "redirected.txt", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 3
+dup2(3, 1)                              = 1
+close(3)                                = 0
+write(1, "This goes to the file\n", 22) = 22
+```
+
+### Descriptor map до і після
+
+```
+До dup2:                    Після dup2(3, 1):            Після close(3):
+fd 0 -> terminal            fd 0 -> terminal             fd 0 -> terminal
+fd 1 -> terminal            fd 1 -+                      fd 1 -> redirected.txt
+fd 3 -> redirected.txt      fd 3 -+-> redirected.txt
+```
+
+`dup2(old, new)` робить так, що `new` вказує на той самий відкритий файл, що й `old` (старе значення `new` закривається). `close(3)` потім прибирає зайве посилання. `printf` не змінювали: він як і раніше пише у fd 1, змінився ресурс за цим дескриптором.
+
+## Завдання 5. exec + redirection
+
+```
+$ ./redirect_exec
+child finished, exit code 0
+$ head -3 ls-output.txt
+total 204
+-rw-r--r-- 1 root root   103 Oct 19 18:10 bad.out
+-rwxr-xr-x 1 root root 16216 Oct 19 18:10 dup2_output
+$ wc -l ls-output.txt
+22 ls-output.txt
+```
+
+Потік: `Parent -> fork -> Child: open -> dup2 -> execvp(ls -l) -> ls пише у fd 1 = ls-output.txt`; `Parent: waitpid`. Після успішного `execvp` код старої програми в child більше не виконується: процес повністю замінено на `ls`, тож `perror("execvp")` спрацює лише при помилці. Дескриптори **переживають `exec`**, тому `ls` успадкував fd 1 вже підмінений.
+
+Дрібниця: `ls` показав у списку і сам `ls-output.txt`, бо файл створюється (`open`) ще до того, як `ls` прочитає каталог.
+
+## Завдання 6. pipeline: `ls -l | wc -l`
+
+```
+$ ./pipeline
+22
+$ ls -l | wc -l
+22
+```
+
+Збіглося з тим, що дає справжній shell.
+
+### Descriptor map
+
+```
+Після pipe() і двох fork():       Parent, Child 1, Child 2 мають: 0,1,2 + 3(read) + 4(write)
+
+Child 1 (ls):  dup2(4, 1); close(3); close(4)   -> 1 = pipe WRITE
+Child 2 (wc):  dup2(3, 0); close(3); close(4)   -> 0 = pipe READ
+Parent:        close(3); close(4)                -> у pipe не бере участі
+
+Після exec:
+   ls stdout (fd 1) ==> [ PIPE ] ==> wc stdin (fd 0)
+```
+
+strace (`-f`, скорочено до суті):
+
+```
+pipe2([3, 4], 0)                         = 0
+clone(...) = 337                         <- child 1
+clone(...) = 338                         <- child 2
+[337] dup2(4, 1)                         = 1      <- ls: stdout у pipe
+[337] close(3) ; close(4)
+[338] dup2(3, 0)                         = 0      <- wc: stdin з pipe
+[338] close(3) ; close(4)
+[336] close(3) ; close(4)                         <- parent закрив обидва кінці
+[337] execve("/usr/bin/ls", ["ls","-l"], ...) = 0
+[338] execve("/usr/bin/wc", ["wc","-l"], ...) = 0
+[336] wait4(337) ; wait4(338)
+```
+
+Перед успішним `execve("/usr/bin/ls")` у trace багато невдалих `execve` з `ENOENT` для інших каталогів зі змінної `PATH`: це `execvp` по черзі перебирає `PATH`, поки не знайде програму.
+
+**Чому parent мусить закрити обидва кінці?** Якщо parent залишить write end відкритим, `wc` ніколи не побачить EOF (writer-ів «ще живі»), і програма зависне, так само як `pipe_no_close bad`.
+
+**Чому `ls` і `wc` працюють одночасно (concurrently)?** Це два окремі процеси. Pipe має буфер, `ls` пише, `wc` читає, а якщо буфер заповнився, `ls` блокується, а якщо порожній, блокується `wc`. Ядро планує їх незалежно.
+
+---
+
+# Part III. Signals
+
+## Завдання 7. SIGINT
+
+`signal_int.c` ставить handler через `sigaction()` і спить у `pause()`. У handler лише `write()`, бо він async-signal-safe, а `printf()` ні (він бере внутрішні блокування stdio, і якщо сигнал прийшов саме під час іншого `printf`, можна зав'язнути).
+
+Два рази надіслав SIGINT (так само працює Ctrl+C у терміналі):
+
+```
+PID: 348 (Ctrl+C - перехоплюється, kill -KILL - ні)
+
+SIGINT received
+
+SIGINT received
+```
+
+Процес після двох SIGINT живий (`kill -0` успішний): handler замінив типову реакцію (завершення). Далі `kill -KILL 348`:
+
+```
+exit status after KILL: 137        (128 + 9)
+```
+
+Процес зник одразу, handler не викликався. Для порівняння, `kill -TERM` (handler немає) дав статус `143` (128 + 15), тобто `Terminated`.
+
+## Завдання 8. kill() і сигнали між процесами
+
+`signal_parent_child.c`: parent через 2 с шле child-у сигнал і чекає на нього через `waitpid`.
+
+```
+$ ./signal_parent_child default
+[child 342] waiting for a signal (mode: default)
+[parent] sending signal 15 (Terminated) to child 342
+[parent] child killed by signal 15 (Terminated)
+
+$ ./signal_parent_child handler
+[child 344] waiting for a signal (mode: handler)
+[parent] sending signal 15 (Terminated) to child 344
+[child] SIGTERM caught, finishing normally
+[parent] child exited normally, code 0
+
+$ ./signal_parent_child kill
+[child 346] waiting for a signal (mode: kill)
+[parent] sending signal 9 (Killed) to child 346
+[parent] child killed by signal 9 (Killed)
+```
+
+| Режим | Що отримав child | Результат |
+|---|---|---|
+| default | SIGTERM, handler немає | вбитий сигналом (`WIFSIGNALED`, 15) |
+| handler | SIGTERM, є handler | сам нормально завершився (`WIFEXITED`, код 0) |
+| kill | SIGKILL | вбитий сигналом (9), handler не міг допомогти |
+
+`kill(pid, SIGTERM)` означає «відправити сигнал SIGTERM», а не «знищити». Що станеться, залежить від disposition сигналу в процесі: типова дія, ігнорувати чи handler. Назва `kill` історична.
+
+## SIGKILL не можна перехопити
+
+```
+sigaction(SIGKILL): Invalid argument
+sigaction(SIGSTOP): Invalid argument
+```
+
+Ядро відмовляє. Якби програма могла перехопити або ігнорувати `SIGKILL`, помилкова чи зловмисна програма стала б невбиваною, і в адміністратора не лишилось би гарантованого способу її зупинити. Тому `SIGKILL` (і `SIGSTOP`) завжди виконує ядро, а процес навіть не бачить цього сигналу.
+
+## Порівняння сигналів
+
+| Сигнал | Звідки | Що за замовчуванням | Можна перехопити |
+|---|---|---|---|
+| `SIGINT` (2) | Ctrl+C у терміналі | завершити | так |
+| `SIGTERM` (15) | `kill pid`, «будь ласка, завершись» | завершити | так (можна прибрати за собою) |
+| `SIGKILL` (9) | `kill -KILL` | завершити негайно | **ні** |
+| `SIGCHLD` (17) | ядро шле parent-у, коли child завершився чи змінив стан | ігнорується | так |
+
+`SIGCHLD` видно в `strace` вище: `--- SIGCHLD {si_code=CLD_EXITED, si_pid=314} ---`.
+
+---
+
+# Part IV. Mini-Shell
+
+## Що вміє `mini_shell.c`
+
+- prompt `myshell> `, читання `fgets`, розбір на токени `strtok` (розділювач пробіл, без лапок і `$VAR`);
+- зовнішні команди: `fork` + `execvp` + `waitpid`;
+- built-in `cd` (через `chdir`) і `exit` без `fork`;
+- перенаправлення `команда > файл`;
+- один pipe `команда | команда`;
+- Ctrl+C: shell ігнорує `SIGINT`, child перед `exec` повертає `SIG_DFL`;
+- Ctrl+D (EOF на stdin) теж завершує shell;
+- без `system()`, без сторонніх парсерів.
+
+## Архітектура
+
+```
+                  USER
+                    |
+                    v
+              MINI-SHELL  (цикл: prompt -> fgets -> strtok)
+                    |
+      +-------------+--------------+
+      v             v              v
+  Built-in       Command        Pipeline  (є "|")
+  cd / exit    (+ ">" file)        |
+      |             |           pipe()
+   chdir()        fork()      +----+----+
+   break            |         v         v
+                    v      Child 1   Child 2
+                  Child       |         |
+                    |      dup2(w,1)  dup2(r,0)
+              [open+dup2]     |         |
+                    |      close x2   close x2
+                  exec        |         |
+                    |       exec      exec
+                    +---------+---------+
+                              v
+                           Kernel
+```
+
+Parent у всіх гілках не виконує програму сам: він чекає (`waitpid`) і повертається до prompt. У pipeline parent закриває обидва кінці pipe одразу після створення дітей і чекає **обох**.
+
+## Чому `cd` це built-in
+
+Якби `cd /tmp` виконував child (`fork -> chdir -> exit`), робочий каталог змінився б лише в child. Каталог належить процесу і не передається батьку. Child завершився б, а parent-shell залишився б у старому каталозі. Тому `chdir` має викликати сам shell. З тієї ж причини `exit` виконує сам shell: «завершитись» можна лише самому, а не попросити child вийти за батька.
+
+Перевірено:
+
+```
+myshell> pwd
+/tmp/.../lab7/t
+myshell> cd /tmp
+myshell> pwd
+/tmp                        <- каталог shell справді змінився
+```
+
+## Перевірка з завдання (реальний сеанс)
+
+Запускав shell у псевдотерміналі (як у справжньому терміналі, Ctrl+C надсилався як символ `\x03`, тобто його обробляв tty, як у реальності):
+
+```
+myshell> pwd
+/tmp/.../lab7/t
+myshell> ls -l
+total 4
+-rw-r--r-- 1 root root 25 Oct 19 18:11 input.txt
+myshell> echo Hello Systems
+Hello Systems
+myshell> cd /tmp
+myshell> pwd
+/tmp
+myshell> echo test > test.txt
+myshell> cat test.txt
+test
+myshell> ls -l | wc -l
+83
+myshell> sleep 30
+^C[Interrupt]
+myshell> echo still-running
+still-running
+myshell> exit
+```
+
+(`83` це кількість рядків у вмісті `/tmp` на моїй машині, у тебе буде інше число. Важливо, що воно збігається з тим, що дає `ls -l | wc -l` у справжньому shell.)
+
+### Redirection
+
+```
+myshell> echo hello > output.txt
+myshell> cat output.txt
+hello
+```
+
+`echo hello` нічого не вивів на екран: у child fd 1 вказує на `output.txt`.
+
+### Pipeline
+
+```
+myshell> cat input.txt | grep error        (input.txt: "a error 1 / b ok / c error 2")
+a error 1
+c error 2
+myshell> ls | wc -l
+2
+```
+
+### Ctrl+C
+
+```
+myshell> sleep 30
+^C[Interrupt]                  <- sleep вбито сигналом SIGINT, shell повідомив
+myshell> echo still-running
+still-running                  <- shell живий
+```
+
+Механіка: Ctrl+C це не команда shell-у, а символ, який термінал (tty) перетворює на `SIGINT` для **всіх** процесів поточної foreground-групи, тобто і для shell, і для `sleep`. Shell має `SIG_IGN` для SIGINT, тож нічого не відбувається. У child `signal(SIGINT, SIG_DFL)` стоїть перед `exec`, тому `sleep` отримує типову реакцію й завершується. Disposition `SIG_IGN` переживає `exec`, тому без явного `SIG_DFL` у child всі команди теж ігнорували б Ctrl+C. А обробник (handler) після `exec` не переживає, бо код замінено, і тому для child був би достатньо й власного handler, але `SIG_DFL` простіший.
+
+### Помилки
+
+| Ситуація | Реакція shell | Shell живий |
+|---|---|---|
+| `nosuchcmd` | `execvp: No such file or directory` (child), parent продовжує | так |
+| `cd /no/such/dir` | `cd: No such file or directory` | так |
+| `echo x >` | `очікується: команда > файл` | так |
+| `\| wc` | `порожня команда біля \|` | так |
+| `ls \| wc > x` | `pipe разом з > не підтримується` | так |
+| `yes \| head -n 2` | `y`, `y`, `[Broken pipe]`, shell працює далі | так |
+
+Для `fork`, `pipe`, `open`, `dup2`, `chdir`, `waitpid` у коді є перевірка на `-1`, `perror` і повернення до prompt. У child після невдалого `exec` використовується `_exit`, а не `exit`, щоб не скинути батьківські буфери stdio вдруге. `waitpid`, перерваний сигналом (`EINTR`), повторюється.
+
+Про `yes | head -n 2`: `head` прочитав два рядки і завершився, read end закрився, і `yes` при наступному `write` отримав `SIGPIPE`. Shell показав `[Broken pipe]`, бо `yes` убито цим сигналом.
+
+## strace mini-shell
+
+Запустив `strace -f -e trace=process,pipe,pipe2,dup2,openat,close,read,write ./mini_shell` з командами `echo hello > output.txt` і `ls | wc -l` (залишив ключові рядки, PID 407 це shell):
+
+```
+407  write(1, "myshell> ", 9)                           <- prompt
+407  read(0, "echo hello > output.txt\nls | wc "..., 4096) = 40   <- fgets читає stdin
+407  clone(...) = 408                                   <- fork для echo
+407  wait4(408, ...)                                    <- waitpid
+408  openat(AT_FDCWD, "output.txt", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 3   <- open для ">"
+408  dup2(3, 1)                    = 1                  <- stdout -> файл
+408  execve("/usr/bin/echo", ["echo", "hello"], ...) = 0
+408  +++ exited with 0 +++
+407  <... wait4 resumed> ... WEXITSTATUS(s) == 0 ...    <- shell дочекався
+407  write(1, "myshell> ", 9)                           <- наступний prompt
+407  pipe2([3, 4], 0)             = 0                   <- pipe для "ls | wc"
+407  clone(...) = 409                                   <- child 1 (ls)
+407  clone(...) = 410                                   <- child 2 (wc)
+409  dup2(4, 1) = 1                                     <- ls: stdout -> pipe
+410  dup2(3, 0) = 0                                     <- wc: stdin <- pipe
+410  execve("/usr/bin/wc", ["wc", "-l"], ...) = 0
+409  execve("/usr/bin/ls", ["ls"], ...) = 0
+410  read(0, "", 16320)            = 0                  <- wc: EOF, writer-ів немає
+407  wait4(409) ... wait4(410)                          <- shell чекає обох
+407  write(1, "myshell> ", 9)
+407  exit_group(0)                                      <- exit
+```
+
+Відповідність архітектурі: `clone` це `fork`, `openat` + `dup2` це реалізація `>`, `pipe2` + два `clone` + два `dup2` це pipeline, `execve` це запуск програми, `wait4` це `waitpid`, `read(0, "", ...) = 0` в `wc` це EOF (завдяки закритим кінцям). У trace фільтром прибрано `close(...)` та службові `openat` бібліотек, їх багато і вони нічого не додають.
+
+Цікаво, що `fgets` прочитав усі три рядки з файла одним `read(0, ..., 4096) = 40`: stdio читає буфером, а командами розбирає вже його.
+
+---
+
+# Відповіді на контрольні питання
+
+1. **Що таке IPC?** Inter-Process Communication: механізми обміну даними між процесами (pipe, сигнали, shared memory, socket тощо). Процеси мають ізольовану пам'ять, тому без IPC вони нічого не передали б одне одному.
+2. **Що створює `pipe()`?** Буфер в ядрі і два дескриптори в таблиці процесу: для читання і для запису.
+3. **Що означає `pipefd[0]`?** Read end (кінець для читання).
+4. **Що означає `pipefd[1]`?** Write end (кінець для запису).
+5. **Чому pipe працює через `read()` та `write()`?** Це дескриптор, а ці виклики працюють з будь-яким дескриптором. Pipe не має особливого API читання/запису.
+6. **Які дескриптори отримує child після `fork()`?** Копії всіх відкритих дескрипторів parent, що вказують на ті самі відкриті об'єкти (тому обидва кінці pipe є і в child).
+7. **Чому треба закривати unused pipe ends?** Щоб (а) відбувся EOF, коли письменник завершиться, (б) не витрачати дескриптори, (в) щоб писати не в pipe без читача. Забутий write end у читача призводить до вічного `read` (`pipe_no_close bad`).
+8. **Коли `read()` з pipe повертає EOF?** Коли в pipe немає даних **і** всі write ends у всіх процесах закриті. Тоді повертає 0.
+9. **Що буде, якщо parent залишить write end відкритим?** Читач не побачить EOF і зависне в `read`. Так і було б у `pipeline`, якби не `close` у parent.
+10. **Що робить `dup2()`?** `dup2(old, new)` робить `new` копією дескриптора `old` (вказує на той самий відкритий файл), закриваючи попереднє значення `new`.
+11. **Як реалізується `>`?** У child перед `exec`: `open(file, O_WRONLY|O_CREAT|O_TRUNC)`, `dup2(fd, STDOUT_FILENO)`, `close(fd)`, `execvp`. Це видно в strace: `openat`, `dup2(3, 1)`.
+12. **Чому програма не повинна знати про redirect?** Вона пише в дескриптор 1, а що за ним (термінал, файл, pipe) не її справа. Тому `ls` без змін працює і в термінал, і в файл, і в pipe.
+13. **Як побудувати `program1 | program2`?** `pipe()`, два `fork`. У child 1 `dup2(w, 1)`, у child 2 `dup2(r, 0)`, у обох закрити обидва кінці, потім `exec`. Parent закриває обидва кінці і `waitpid` на обох.
+14. **Який descriptor першої програми підключається до pipe?** stdout (fd 1), на write end.
+15. **Який descriptor другої?** stdin (fd 0), на read end.
+16. **Що таке signal?** Асинхронне повідомлення процесу від ядра або іншого процесу про подію (Ctrl+C, завершення child, помилка пам'яті).
+17. **Чим signal відрізняється від pipe?** Pipe передає потік байтів (дані), signal лише номер події без даних. Pipe читають коли хочуть, сигнал приходить сам і перериває виконання.
+18. **Що робить `kill()`?** Надсилає процесу вказаний сигнал. Чи процес помре, залежить від сигналу і його disposition.
+19. **SIGTERM vs SIGKILL?** SIGTERM «прошу завершитись»: його можна перехопити, прибрати за собою, чи навіть ігнорувати. SIGKILL ядро виконує саме, перехопити чи ігнорувати не можна.
+20. **Чому SIGKILL не можна перехопити?** Щоб завжди існував гарантований спосіб зупинити процес. `sigaction(SIGKILL)` у мене повернув `Invalid argument`.
+21. **Що таке SIGINT?** Сигнал переривання від терміналу (Ctrl+C), за замовчуванням завершує процес, але його можна перехопити (`signal_int`).
+22. **Чому `printf()` поганий у handler?** Він не async-signal-safe: використовує внутрішній буфер і блокування. Якщо сигнал прийшов у момент іншого `printf`, обробник може зіпсувати буфер або зависнути на блокуванні.
+23. **Що таке async-signal-safe функція?** Функція, яку POSIX дозволяє викликати з handler, бо вона коректна навіть коли перервала іншу виконувану функцію (наприклад `write`, `_exit`).
+24. **Чому shell це user-space програма?** Він не потребує привілеїв ядра: лише викликає системні виклики (`fork`, `exec`, `pipe`, `dup2`, `wait`). Тому ми й написали його як звичайну програму, і shell можна замінити іншим.
+25. **Що робить `fork()` у shell?** Створює копію shell-процесу, в якій можна підготувати середовище (дескриптори, сигнали) й запустити команду, не чіпаючи самого shell.
+26. **Що робить `exec()`?** Замінює код і дані поточного процесу новою програмою (PID той самий). Повернення не буває, окрім помилки.
+27. **Для чого `waitpid()`?** Щоб shell дочекався завершення команди перед наступним prompt, отримав код завершення і прибрав процес (щоб не лишився zombie).
+28. **Чому `cd` це built-in?** Робочий каталог належить процесу. Якби `chdir` викликав child, змінився б лише його каталог, а shell залишився б там, де був.
+29. **Чому `exit` виконує сам shell?** Бо треба завершити саме shell. Child, що завершився б, лише повернув би керування shell-у.
+30. **Чому `system()` не підходить?** Він запускає `/bin/sh -c`, тобто інший shell, який і робить усю роботу (fork, exec, pipe). Мета лаби як раз реалізувати ці механізми самому.
+31. **Що з дескрипторами після `exec()`?** За замовчуванням залишаються відкритими (крім позначених `FD_CLOEXEC`). Тому `dup2` перед `exec` працює: нова програма успадковує підмінені 0/1/2.
+32. **Як `fork`, `pipe`, `dup2` разом дають pipeline?** `pipe` створює канал, `fork` розмножує його кінці по процесах, `dup2` ставить кінці на stdin/stdout, `exec` запускає програми, які про pipe нічого не знають.
+33. **Чому процеси pipeline виконуються concurrently?** Обидва живі одночасно, ядро планує їх незалежно. Синхронізує лише буфер pipe: переповнений блокує письменника, порожній блокує читача.
+34. **Що буде, якщо reader завершився, а writer пише далі?** Writer отримує `SIGPIPE` (за замовчуванням вмирає) або `EPIPE`, якщо сигнал ігнорується. У мене `yes | head -n 2` закінчився `[Broken pipe]`.
+35. **Що закриває parent після створення pipeline?** Обидва кінці pipe (`pipefd[0]` і `pipefd[1]`): сам він не читає і не пише, а відкритий write end не дав би читачу отримати EOF.
+
+---
+
+# Висновок
+
+Лабораторна показала, що shell це звичайна програма з невеликого набору системних викликів. `fork` створює процес, `exec` підміняє програму, `waitpid` чекає завершення, `pipe` дає канал, а `dup2` підставляє його (або файл) на місце stdin/stdout. Програми `ls`, `wc`, `echo` не знають, куди пишуть: за дескриптором 1 може бути термінал, файл чи pipe.
+
+Головна практична пастка pipe це забуті кінці. Експеримент `pipe_no_close bad` показав, що `read` висить у стані `anon_pipe_read`, поки хтось тримає write end, і EOF буде лише коли закриті всі. Тому і child, і parent мусять закрити те, чого не використовують.
+
+Про сигнали: `SIGINT` і `SIGTERM` можна перехопити, `SIGKILL` ні. У mini-shell це дало просте рішення для Ctrl+C: shell ігнорує `SIGINT`, а child перед `exec` повертає типову реакцію, і `sleep 30` переривається, а shell лишається живим. А `cd` і `exit` мусять виконуватись у самому shell, бо каталог і час життя належать процесу.
 
 </details>
